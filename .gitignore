@@ -1,0 +1,5 @@
+AGENTS.md
+.gocache
+ha-tools
+home-assistant_v2.db
+test-*.sh
