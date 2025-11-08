@@ -2,13 +2,11 @@ package cmd
 
 import (
 	"context"
-	"crypto/tls"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
-	"net"
 	"strconv"
 	"strings"
 	"time"
@@ -55,28 +53,9 @@ func init() {
 }
 
 func transferGPSData(ctx context.Context, sqlitePath, mysqlDSN string) error {
-	// TLS config for tidb cloud.
-	if strings.Contains(mysqlDSN, "tls=tidb") {
-		dummyDSN := strings.ReplaceAll(mysqlDSN, "tls=tidb", "tls=")
-		cfg, err := mysql.ParseDSN(dummyDSN)
-		if err != nil {
-			return fmt.Errorf("parse mysql dsn: %w", err)
-		}
-
-		serverName := cfg.Addr
-		if host, _, splitErr := net.SplitHostPort(serverName); splitErr == nil {
-			serverName = host
-		}
-		if len(serverName) == 0 {
-			serverName = "localhost"
-		}
-
-		if err := mysql.RegisterTLSConfig("tidb", &tls.Config{
-			MinVersion: tls.VersionTLS12,
-			ServerName: serverName,
-		}); err != nil && !strings.Contains(err.Error(), "already registered") {
-			return fmt.Errorf("register tls config %q: %w", "tidb", err)
-		}
+	mysqlDSN = ensureParseTimeEnabled(mysqlDSN)
+	if err := maybeRegisterTiDBTLS(mysqlDSN); err != nil {
+		return fmt.Errorf("configure mysql tls: %w", err)
 	}
 
 	sqliteDB, err := sql.Open("sqlite", sqlitePath)
@@ -138,12 +117,36 @@ ON DUPLICATE KEY UPDATE
     last_updated = VALUES(last_updated)
 `
 
+	const gpsBatchSize = 500
+
 	var (
 		args          []any
 		valueSegments strings.Builder
 		rowCount      int
 	)
 	valueSegments.Grow(256)
+
+	flushBatch := func() error {
+		if rowCount == 0 {
+			return nil
+		}
+
+		var queryBuilder strings.Builder
+		queryBuilder.Grow(len(upsertPrefix) + valueSegments.Len() + len(upsertSuffix) + 1)
+		queryBuilder.WriteString(upsertPrefix)
+		queryBuilder.WriteString(valueSegments.String())
+		queryBuilder.WriteByte('\n')
+		queryBuilder.WriteString(upsertSuffix)
+
+		if _, err := mysqlDB.ExecContext(ctx, queryBuilder.String(), args...); err != nil {
+			return fmt.Errorf("upsert mysql rows: %w", err)
+		}
+
+		valueSegments.Reset()
+		args = args[:0]
+		rowCount = 0
+		return nil
+	}
 	for rows.Next() {
 		var (
 			stateID        int64
@@ -184,28 +187,19 @@ ON DUPLICATE KEY UPDATE
 			lastUpdated,
 		)
 		rowCount++
+
+		if rowCount >= gpsBatchSize {
+			if err := flushBatch(); err != nil {
+				return err
+			}
+		}
 	}
 
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("iterate sqlite rows: %w", err)
 	}
 
-	if rowCount == 0 {
-		return nil
-	}
-
-	var queryBuilder strings.Builder
-	queryBuilder.Grow(len(upsertPrefix) + valueSegments.Len() + len(upsertSuffix) + 1)
-	queryBuilder.WriteString(upsertPrefix)
-	queryBuilder.WriteString(valueSegments.String())
-	queryBuilder.WriteByte('\n')
-	queryBuilder.WriteString(upsertSuffix)
-
-	if _, err := mysqlDB.ExecContext(ctx, queryBuilder.String(), args...); err != nil {
-		return fmt.Errorf("upsert mysql rows: %w", err)
-	}
-
-	return nil
+	return flushBatch()
 }
 
 func ensureGPSPointsTable(ctx context.Context, db *sql.DB) error {
@@ -441,6 +435,27 @@ func pickFloat(v any) (float64, bool) {
 		return f, true
 	default:
 		return 0, false
+	}
+}
+
+func pickString(v any) (string, bool) {
+	switch val := v.(type) {
+	case nil:
+		return "", false
+	case string:
+		trimmed := strings.TrimSpace(val)
+		if trimmed == "" {
+			return "", false
+		}
+		return trimmed, true
+	case fmt.Stringer:
+		str := strings.TrimSpace(val.String())
+		if str == "" {
+			return "", false
+		}
+		return str, true
+	default:
+		return "", false
 	}
 }
 
