@@ -230,7 +230,16 @@ ON DUPLICATE KEY UPDATE
 			return fmt.Errorf("parse attributes for state_id %d: %w", stateID, err)
 		}
 
+		trimmedState := strings.TrimSpace(strings.ToLower(state))
+		if trimmedState == "unavailable" || trimmedState == "unknown" {
+			continue
+		}
+
 		numericState := parseNumericState(state)
+		if !numericState.Valid {
+			// Skip non numeric values (e.g. "on"/"off") to avoid writing NULL numeric_state rows.
+			continue
+		}
 		row := energyRow{
 			stateID:      stateID,
 			entityID:     entityID,
